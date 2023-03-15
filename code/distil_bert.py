@@ -24,7 +24,8 @@ argp.add_argument('--batch_size', default=256, type=int)
 argp.add_argument('--epochs', default=10, type=int)
 argp.add_argument('--crisis_data', action='store_true')
 argp.add_argument('--lm', default=None)
-argp.add_argument('--contrastive_loss_lambda', default=0.5, type=float)
+argp.add_argument('--contrastive_loss_lambda', default=0, type=float)
+argp.add_argument('--prototypical_network', action='store_true')
 args = argp.parse_args()
 
 id2label = {0: "NEGATIVE", 1: "POSITIVE"}
@@ -51,7 +52,7 @@ class WrapperModelForCl(nn.Module):
         self.dense2 = nn.Linear(1600, 768)
         self.out_proj = nn.Linear(768, 2)
 
-    def forward(self, input_id, mask):
+    def forward(self, input_id, mask, labels):
         pooled_output = self.bert(input_ids= input_id, attention_mask=mask,return_dict=False)
         features = pooled_output[0][:,0,:]
         x = self.dropout(features)
@@ -63,6 +64,43 @@ class WrapperModelForCl(nn.Module):
         x = self.dropout(x)
         x = self.out_proj(x)
         return x
+
+
+class ProtoTypeNetwork(nn.Module):
+    def __init__(self, dropout=0.5):
+        super().__init__()
+        self.bert = get_language_model()
+        for param in self.bert.parameters():
+            param.requires_grad = False
+        self.dropout = nn.Dropout(dropout)
+        self.dense = nn.Linear(768, 768)
+        self.c_0_proto = None
+        self.c_1_proto = None
+
+    def forward(self, input_id, mask, labels=None):
+        pooled_output = self.bert(input_ids= input_id, attention_mask=mask,return_dict=False)
+        features = pooled_output[0][:,0,:]
+        x = self.dropout(features)
+        x = self.dense(x)
+        embeddings = torch.relu(x)
+
+        if labels != None:
+            one_embeddings = embeddings[(labels == 1)]
+            zero_embeddings = embeddings[(labels == 0)]
+            self.c_0_proto = torch.sum(zero_embeddings, dim=0) / zero_embeddings.shape[0]
+            self.c_1_proto = torch.sum(one_embeddings, dim=0) / one_embeddings.shape[0]
+
+        distance_c_0 = torch.cdist(embeddings.view(embeddings.shape[0], embeddings.shape[1]),
+                                   self.c_0_proto.view(1, -1))
+        distance_c_1 = torch.cdist(embeddings.view(embeddings.shape[0], embeddings.shape[1]),
+                                   self.c_1_proto.view(1, -1))
+        all_distances = -1 * torch.cat([distance_c_0, distance_c_1], dim=1)
+        #softmax_distances = torch.softmax(all_distances, dim=1)
+        return all_distances
+
+def get_wrapper_for_prototypical_network():
+    print("Loading prototypical network")
+    return ProtoTypeNetwork().to(device)
 
 def get_wrapper_model_for_classification():
     return WrapperModelForCl().to(device)
@@ -256,11 +294,14 @@ def train_epoch(optimizer, model, loader):
         # Clear the gradients
         optimizer.zero_grad()
         # Run a forward pass
-        output = model(input_ids, masks)
+        output = model(input_ids, masks, labels)
         cross_entropy_loss = ce_loss(output, labels)
-        contrastive_loss = sc_loss(output.view(output.shape[0], 1, output.shape[1]), labels=labels)
         cl_lambda = args.contrastive_loss_lambda
-        loss = (1 - cl_lambda) * cross_entropy_loss + cl_lambda * contrastive_loss
+        if cl_lambda > 0:
+            contrastive_loss = sc_loss(output.view(output.shape[0], 1, output.shape[1]), labels=labels)
+            loss = (1 - cl_lambda) * cross_entropy_loss + cl_lambda * contrastive_loss
+        else:
+            loss = cross_entropy_loss
 
         # Calculate the gradients
         loss.backward()
@@ -330,7 +371,10 @@ def save_checkpoint(model, ckpt_path):
     print('Saved checkpoint')
 
 #model = get_classification_model_pretrained()
-model = get_wrapper_model_for_classification()
+if args.prototypical_network:
+    model = get_wrapper_for_prototypical_network()
+else:
+    model = get_wrapper_model_for_classification()
 
 if args.test_data_path:
     test_data_df = pd.read_csv(args.test_data_path)
