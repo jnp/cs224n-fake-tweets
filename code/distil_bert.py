@@ -7,6 +7,7 @@ import pandas as pd
 import argparse
 from tqdm import tqdm
 from torch.optim.lr_scheduler import StepLR
+from sklearn.model_selection import train_test_split
 import mlflow
 device = 'cuda' if cuda.is_available() else 'cpu'
 
@@ -20,23 +21,30 @@ argp.add_argument('--checkpoint_path', default=None)
 argp.add_argument('--learning_rate', default=6e-5, type=float)
 argp.add_argument('--weight_decay', default=0.1, type=float)
 argp.add_argument('--learning_decay', default=0.01, type=float)
-argp.add_argument('--batch_size', default=256, type=int)
+argp.add_argument('--batch_size', default=32, type=int)
 argp.add_argument('--epochs', default=10, type=int)
 argp.add_argument('--crisis_data', action='store_true')
 argp.add_argument('--lm', default=None)
 argp.add_argument('--contrastive_loss_lambda', default=0, type=float)
+argp.add_argument('--few_shots', default=-1, type=int)
 argp.add_argument('--prototypical_network', action='store_true')
+argp.add_argument('--model_summary', action='store_true')
 args = argp.parse_args()
 
 id2label = {0: "NEGATIVE", 1: "POSITIVE"}
 label2id = {"NEGATIVE": 0, "POSITIVE": 1}
 
-
+classification_model_name = "distilbert-base-uncased-finetuned-sst-2-english"
+#classification_model_name = "roberta-base"
+language_model_name = 'distilbert-base-uncased'
+#language_model_name = 'roberta-base'
 def get_language_model():
-    model = AutoModel.from_pretrained('distilbert-base-uncased').to(device)
+    model = AutoModel.from_pretrained(language_model_name).to(device)
     if args.lm:
         print("Load base model from checkpoint")
         model.load_state_dict(torch.load(args.lm))
+        for param in model.parameters():
+            param.requires_grad = False
     return model
 
 
@@ -45,11 +53,11 @@ class WrapperModelForCl(nn.Module):
     def __init__(self, dropout=0.5):
         super().__init__()
         self.bert = get_language_model()
-        for param in self.bert.parameters():
-            param.requires_grad = False
+            # for param in self.bert.parameters():
+            #     param.requires_grad = False
         self.dropout = nn.Dropout(dropout)
-        self.dense1 = nn.Linear(768, 1600)
-        self.dense2 = nn.Linear(1600, 768)
+        self.dense1 = nn.Linear(768, 768)
+        #self.dense2 = nn.Linear(1600, 768)
         self.out_proj = nn.Linear(768, 2)
 
     def forward(self, input_id, mask, labels):
@@ -59,9 +67,9 @@ class WrapperModelForCl(nn.Module):
         x = self.dense1(x)
         x = torch.relu(x)
         x = self.dropout(x)
-        x = self.dense2(x)
-        x = torch.relu(x)
-        x = self.dropout(x)
+        #x = self.dense2(x)
+        #x = torch.relu(x)
+        #x = self.dropout(x)
         x = self.out_proj(x)
         return x
 
@@ -106,24 +114,29 @@ def get_wrapper_model_for_classification():
     return WrapperModelForCl().to(device)
 
 def get_classification_model_pretrained():
-    model_name = "distilbert-base-uncased-finetuned-sst-2-english"
-    model_version = "af0f99b"
     model = AutoModelForSequenceClassification.from_pretrained(
-        model_name, num_labels=2, id2label=id2label, label2id=label2id
+        classification_model_name, num_labels=2, id2label=id2label, label2id=label2id
     ).to(device)
     return model
 
 def get_classification_tokenizer():
-    model_name = "distilbert-base-uncased-finetuned-sst-2-english"
-    model_version = "af0f99b"
-    return AutoTokenizer.from_pretrained(model_name)
+    return AutoTokenizer.from_pretrained(classification_model_name)
 
+# to clean data
+def normalize_text(text):
+    text = text.str.lower() # lowercase
+    text = text.str.replace(r"\#","") # replaces hashtags
+    text = text.str.replace(r"http\S+","URL")  # remove URL addresses
+    text = text.str.replace(r"@","")
+    text = text.str.replace(r"[^A-Za-z0-9()!?\'\`\"]", " ")
+    text = text.str.replace("\s{2,}", " ")
+    return text
 
 class TweetDataset(Dataset):
     def __init__(self, data_df):
         self.input_df = data_df
         self.tokenizer = get_classification_tokenizer()
-        self.encoded_input = self.tokenizer(self.input_df['text'].tolist(), padding=True, truncation=True)
+        self.encoded_input = self.tokenizer(self.input_df['text'].tolist(), padding='max_length', truncation=True, max_length=76)
         print("Number of examples = ", len(self.encoded_input['input_ids']))
         if 'target' in self.input_df.columns:
             self.labels = self.input_df['target'].tolist()
@@ -136,7 +149,7 @@ class TweetDataset(Dataset):
     def __getitem__(self, idx):
         try:
             input_ids = self.encoded_input['input_ids'][idx]
-            attention_mask = self.encoded_input['input_ids'][idx]
+            attention_mask = self.encoded_input['attention_mask'][idx]
             if self.labels:
                 label = int(self.labels[idx])
                 if label != 0 and label != 1:
@@ -152,8 +165,8 @@ class TweetDataset(Dataset):
 class SupConLoss(nn.Module):
     """Supervised Contrastive Learning: https://arxiv.org/pdf/2004.11362.pdf.
     It also supports the unsupervised contrastive loss in SimCLR"""
-    def __init__(self, temperature=0.07, contrast_mode='all',
-                 base_temperature=0.07):
+    def __init__(self, temperature=0.3, contrast_mode='all',
+                 base_temperature=0.3):
         super(SupConLoss, self).__init__()
         self.temperature = temperature
         self.contrast_mode = contrast_mode
@@ -287,6 +300,7 @@ def train_epoch(optimizer, model, loader):
     total_loss = 0
     ce_loss = nn.CrossEntropyLoss()
     sc_loss = SupConLoss()
+    true_positives, false_positives, false_negatives, true_negatives = 0, 0, 0, 0
     for a in tqdm(loader):
         input_ids = torch.from_numpy(np.array(a[0])).to(device)
         masks = torch.from_numpy(np.array(a[1])).to(device)
@@ -305,11 +319,19 @@ def train_epoch(optimizer, model, loader):
 
         # Calculate the gradients
         loss.backward()
+
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         # Update the parameteres
         optimizer.step()
         total_loss += loss.item()
+        tp, fp, fn, tn = get_accuracy_stats(output, labels)
+        true_positives += tp
+        false_positives += fp
+        false_negatives += fn
+        true_negatives += tn
 
-    return total_loss
+    accuracy, f1_score = compute_accuracy(true_positives, false_positives, false_negatives, true_negatives)
+    return accuracy, f1_score, total_loss
 
 def test_model(model, loader):
     model.eval()
@@ -322,7 +344,7 @@ def test_model(model, loader):
             masks = torch.from_numpy(np.array(a[1])).to(device)
             #labels = torch.from_numpy(np.array(a[2])).to(device)
             output = model(input_ids, masks)
-            output_labels = torch.argmax(output.logits, dim=1).int()
+            output_labels = torch.argmax(output, dim=1).int()
             tmp_df = pd.DataFrame()
             tmp_df['id'] = a[3]
             tmp_df['target'] = output_labels.tolist()
@@ -334,34 +356,47 @@ def test_model(model, loader):
 def compare_scalar(t_tensor, s):
     return t_tensor.eq(torch.from_numpy(np.array([s])).to(device))
 
-def get_accuracy_stats(predictions, labels):
+def get_accuracy_stats(logits, labels):
+    predictions = torch.argmax(logits, dim=1).int()
     true_positives = torch.sum(torch.logical_and(compare_scalar(labels, 1), compare_scalar(predictions, 1)).int()).item()
     false_positives = torch.sum(torch.logical_and(compare_scalar(labels, 0), compare_scalar(predictions, 1)).int()).item()
     false_negatives = torch.sum(torch.logical_and(compare_scalar(labels, 1), compare_scalar(predictions, 0)).int()).item()
     true_negatives = torch.sum(torch.logical_and(compare_scalar(labels, 0), compare_scalar(predictions, 0)).int()).item()
     return true_positives, false_positives, false_negatives, true_negatives
 
+def compute_accuracy(true_positives, false_positives, false_negatives, true_negatives):
+    f1_score = true_positives / (true_positives + 0.5 *(false_positives + false_negatives))
+    accuracy = (true_positives+true_negatives) / (true_positives + false_positives + false_negatives + true_negatives) * 100
+    return accuracy, f1_score
 
 def eval_model(model, loader):
     # Keep track of the total loss for the batch
-    print("Evaluating Model")
     true_positives, false_positives, false_negatives, true_negatives = 0, 0, 0, 0
+    ce_loss = nn.CrossEntropyLoss()
+    sc_loss = SupConLoss()
+    total_loss = 0
     with torch.no_grad():
         for a in tqdm(loader):
             input_ids = torch.from_numpy(np.array(a[0])).to(device)
             masks = torch.from_numpy(np.array(a[1])).to(device)
             labels = torch.from_numpy(np.array(a[2])).to(device)
             output = model(input_ids, masks)
-            predictions = torch.argmax(output, dim=1).int()
-            tp, fp, fn, tn = get_accuracy_stats(predictions, labels)
+            cross_entropy_loss = ce_loss(output, labels)
+            cl_lambda = args.contrastive_loss_lambda
+            if cl_lambda > 0:
+                contrastive_loss = sc_loss(output.view(output.shape[0], 1, output.shape[1]), labels=labels)
+                loss = (1 - cl_lambda) * cross_entropy_loss + cl_lambda * contrastive_loss
+            else:
+                loss = cross_entropy_loss
+            tp, fp, fn, tn = get_accuracy_stats(output, labels)
             true_positives += tp
             false_positives += fp
             false_negatives += fn
             true_negatives += tn
+            total_loss += loss.item()
 
-    f1_score = true_positives / (true_positives + 0.5 *(false_positives + false_negatives))
-    accuracy = (true_positives+true_negatives) / (true_positives + false_positives + false_negatives + true_negatives) * 100
-    return accuracy, f1_score
+    accuracy, f1_score = compute_accuracy(true_positives, false_positives, false_negatives, true_negatives)
+    return accuracy, f1_score, total_loss
 
 def save_checkpoint(model, ckpt_path):
     if ckpt_path is None:
@@ -376,8 +411,14 @@ if args.prototypical_network:
 else:
     model = get_wrapper_model_for_classification()
 
+
+if args.model_summary:
+   print(model)
+   exit(0)
+
 if args.test_data_path:
     test_data_df = pd.read_csv(args.test_data_path)
+    test_data_df['text'] = normalize_text(test_data_df['text'])
     test_tweet_ds = TweetDataset(test_data_df)
     loader = DataLoader(test_tweet_ds, shuffle=False, batch_size=args.batch_size, collate_fn=custom_collate_fn)
     model.load_state_dict(torch.load((args.checkpoint_path)))
@@ -393,9 +434,21 @@ training_input_df = training_input_df.drop(columns=['keyword', 'location']).drop
 if args.crisis_data:
     crisis_data_df = pd.read_csv('../data/crisis6.csv').dropna()
     training_input_df = training_input_df.append(crisis_data_df)
-split_mask = np.random.rand(len(training_input_df)) < 0.8
-train_data_df = training_input_df[split_mask].reset_index(drop=True)
-eval_data_df = training_input_df[~split_mask].reset_index(drop=True)
+
+training_input_df['text'] = normalize_text(training_input_df['text'])
+train_data_df, eval_data_df = train_test_split(training_input_df)
+
+if args.few_shots > 0:
+    print('Few Shots = ', args.few_shots)
+    train_data_df = train_data_df.sample(n=args.few_shots)
+
+train_data_df = train_data_df.reset_index(drop=True)
+eval_data_df = eval_data_df.reset_index(drop=True)
+# split_mask = np.random.rand(len(training_input_df)) < 0.8
+# train_data_df = training_input_df[split_mask].reset_index(drop=True)
+# train_data_df['text'] = normalize_text(train_data_df['text'])
+# eval_data_df = training_input_df[~split_mask].reset_index(drop=True)
+# eval_data_df['text'] = normalize_text(eval_data_df['text'])
 
 print("Create dataset for training")
 train_tweet_ds = TweetDataset(train_data_df)
@@ -419,21 +472,43 @@ eval_loader = DataLoader(eval_tweet_ds, shuffle=True, batch_size=args.batch_size
 
 with mlflow.start_run() as run:
     mlflow.log_param("args", str(args))
+    patience = 5
+    num_no_improvement = 0
+    best_val_loss = float('inf')
+    store_val_loss = []
+    best_val_accuracy = -float('inf')
     for epoch in range(args.epochs+1):
         print("Epoch: {}/{}".format(epoch, args.epochs))
         model.train()
         scheduler.step(epoch)
-        epoch_loss = train_epoch(optimizer, model, train_loader)
-        mlflow.log_metric("loss", epoch_loss)
-        print(epoch_loss)
-        if epoch % 5 == 0:
+        train_accuracy, train_f1_score, epoch_loss = train_epoch(optimizer, model, train_loader)
+        mlflow.log_metric("train_loss", epoch_loss)
+        print('Training Loss', epoch_loss)
+        if epoch > 3 and epoch % 2 == 0:
+            print("Evaluating Model")
             model.eval()
-            accuracy, f1_score = eval_model(model, train_loader)
-            print("Train Evaluation Accuracy = {}".format(accuracy))
-            print("Train Evaluation F1 Score = {}".format(f1_score))
-            dev_accuracy, dev_f1_score = eval_model(model, eval_loader)
+            dev_accuracy, dev_f1_score, eval_loss = eval_model(model, eval_loader)
+            print('Dev loss', eval_loss)
+            print("Train Evaluation Accuracy = {}".format(train_accuracy))
+            print("Train Evaluation F1 Score = {}".format(train_f1_score))
             print("Dev Evaluation Accuracy = {}".format(dev_accuracy))
             print("Dev Evaluation F1 Score = {}".format(dev_f1_score))
-            mlflow.log_metrics({"Train_Accuracy": accuracy, "Train_F1_score": f1_score,
-                                "Dev_Accuracy": dev_accuracy, "Dev_F1_Score": dev_f1_score})
-            save_checkpoint(model, args.checkpoint_path)
+            print("Best Dev Accuracy = {}".format(best_val_accuracy))
+            mlflow.log_metrics({"Train_Accuracy": train_accuracy, "Train_F1_score": train_f1_score,
+                                "Dev_Accuracy": dev_accuracy, "Dev_F1_Score": dev_f1_score, "dev_loss": eval_loss})
+            store_val_loss.append(eval_loss)
+
+            # Check if validation loss has improved
+            mean_val_loss = np.mean(store_val_loss)
+            if mean_val_loss < best_val_loss:
+                best_val_loss = mean_val_loss
+                #save_checkpoint(model, args.checkpoint_path)
+                num_no_improvement = 0
+            else:
+                num_no_improvement += 1
+            if dev_accuracy > best_val_accuracy:
+                best_val_accuracy = dev_accuracy
+                save_checkpoint(model, args.checkpoint_path)
+            if num_no_improvement == patience:
+                print('No more improvement expected, exiting')
+                break
